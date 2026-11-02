@@ -1,0 +1,8 @@
+{
+  "tasks": [
+    { "name": "images", "enabledBy": "IMAGE_BUILD" },
+    { "name": "go-tests", "enabledBy": "GO_CHECKS", "uses": ["postgres", "go"] },
+    { "name": "e2e", "enabledBy": "E2E_CHECKS" },
+    { "name": "coverage", "enabledBy": "TS_CHECKS" }
+  ]
+}

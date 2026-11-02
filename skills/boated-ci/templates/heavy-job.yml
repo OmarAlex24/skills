@@ -1,0 +1,315 @@
+# A "boated" CI: ONE heavy job per pull-request run instead of N parallel jobs.
+#
+# Built for runner providers that bill or cap per MACHINE START (every job that
+# gets a runner = 1 start; a job skipped by `if:` = 0). The job:
+#   1. routes changed files to flags (the router is a step, not a job),
+#   2. decides which background tasks already passed on this exact code (reruns),
+#   3. starts the slow independent tasks in the background,
+#   4. runs the foreground trunk (install, lint, typecheck, build, unit tests),
+#   5. waits for every task, measures the machine, uploads logs and publishes
+#      one check run `quality / <task>` per task.
+#
+# Copy the skill's scripts/ to .github/boated-ci/ (or change CI_SCRIPTS) and
+# the manifest templates/ci-tasks.json to .github/ci-tasks.json.
+# Task names here (e2e, go-tests, images, coverage) are examples: rename them,
+# but keep the names identical in the manifest, start/wait steps and `steps.skip.outputs.*`.
+#
+# Pin third-party actions by commit SHA in production; tags are used here for readability.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Per-start billing changes the concurrency trade-off:
+# - Pull requests: a new push makes the old run moot, so cancel it (its start
+#   is already paid either way, but the rest of its minutes are saved).
+# - main: NEVER cancel a run that already started (it paid its start and would
+#   have to be paid again). With cancel-in-progress false, GitHub keeps one run
+#   in progress and ONE pending; a newer push replaces the pending run before
+#   it starts any job, so bursts of merges cost no extra starts.
+concurrency:
+  group: ${{ github.event_name == 'push' && 'ci-main' || format('ci-{0}', github.event.pull_request.number || github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CI_SCRIPTS: .github/boated-ci
+
+jobs:
+  quality:
+    # This name is the ONLY required status check of the branch protection.
+    # The per-task checks (`quality / e2e`, ...) are informative, not required:
+    # a skipped-on-rerun task publishes no new check.
+    name: quality
+    # Runner by repository variable with a default: an incident (provider down,
+    # wrong size) is fixed by changing a variable, without a PR.
+    #   gh variable set CI_RUNS_ON_QUALITY --body '["boat-xlarge"]'
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON_QUALITY || '["boat-large"]') }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      checks: write # publish `quality / <task>` and read them back on reruns
+    env:
+      CHECK_JOB_NAME: quality # must equal `name:` above (check-name prefix)
+      CI_TASKS_FILE: .github/ci-tasks.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # the router diffs the PR merge commit against its first parent
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      # Whole-machine CPU/steal/memory every 2 s, for the metrics table at the end.
+      - name: Sample the machine in the background
+        continue-on-error: true
+        run: bash "$CI_SCRIPTS/machine-sampler.sh"
+
+      # ROUTER AS A STEP: what used to be a `detect-changes` job (a whole start
+      # for ~40 s of work). Flags go to $GITHUB_ENV, so later steps AND the
+      # background tasks (which inherit the step env) see them.
+      # Fail closed: not a PR, a diff error, or a change under .github/ => run everything.
+      - name: Route changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          all=false
+          files=""
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            all=true
+          elif ! files="$(git diff --name-only HEAD^1 HEAD)"; then
+            all=true
+          fi
+          if grep -qE '^(\.github/|package\.json$|bun\.lock)' <<<"$files"; then all=true; fi
+          has() { $all || grep -qE "$1" <<<"$files"; }
+          flag() { if has "$2"; then echo "$1=true"; else echo "$1=false"; fi >>"$GITHUB_ENV"; }
+          flag TS_CHECKS   '^(apps|packages)/.*\.(ts|tsx|json)$'
+          flag E2E_CHECKS  '^(apps/web|e2e)/'
+          flag GO_CHECKS   '^services/.*\.go$|go\.(mod|sum)$'
+          flag IMAGE_BUILD '(^|/)Dockerfile$|docker-bake\.hcl$'
+          cat "$GITHUB_ENV"
+
+      # SKIP-ON-RERUN: on a PR rerun, tasks whose `quality / <task>` check is
+      # already green for this exact merge commit do not run again. Outputs
+      # `steps.skip.outputs.<task|resource>` are "true" only to skip; if this
+      # step fails or does not run they are empty and EVERYTHING runs.
+      # Kill switch: repository variable CI_TASK_SKIP_PASSED=false.
+      - name: Skip tasks that already passed
+        id: skip
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_TASK_SKIP_PASSED: ${{ vars.CI_TASK_SKIP_PASSED }}
+        run: bun "$CI_SCRIPTS/ci-task.ts" plan
+
+      # --- Background tasks that do NOT need the JS install start first ----------
+      # Order: start the LONGEST tasks as early as their inputs allow; the job
+      # takes as long as its slowest task plus whatever it waits for.
+
+      - name: "images: set up buildx"
+        if: env.IMAGE_BUILD == 'true' && steps.skip.outputs.images != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: "images: start in the background"
+        if: env.IMAGE_BUILD == 'true' && steps.skip.outputs.images != 'true'
+        run: |
+          bun "$CI_SCRIPTS/ci-task.ts" start images <<'EOF'
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          # Build-only on PRs: proves the Dockerfiles compile, pushes nothing.
+          docker buildx bake --file docker-bake.hcl
+          EOF
+
+      # Shared resources: their prep steps are skipped only if EVERY task that
+      # uses them is skipped or disabled (`uses` in the manifest).
+      - name: "postgres: start"
+        if: env.GO_CHECKS == 'true' && steps.skip.outputs.postgres != 'true'
+        run: |
+          docker run -d --name ci-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
+          for _ in $(seq 1 30); do docker exec ci-pg pg_isready -U postgres && break; sleep 1; done
+
+      # `uses:` steps cannot run in the background; keep them short and gated.
+      - name: "go: set up toolchain"
+        if: env.GO_CHECKS == 'true' && steps.skip.outputs.go != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/api/go.mod
+
+      - name: "go-tests: start in the background"
+        if: env.GO_CHECKS == 'true' && steps.skip.outputs.go-tests != 'true'
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+        run: |
+          bun "$CI_SCRIPTS/ci-task.ts" start go-tests <<'EOF'
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/services/api"
+          go vet ./...
+          go test -race ./...
+          # Any gate that can fail (e.g. diff coverage) must live INSIDE the
+          # task: a separate step after it would be silently skipped together
+          # with the task on a rerun.
+          EOF
+
+      # --- Foreground trunk ------------------------------------------------------
+
+      - name: Install dependencies
+        id: install
+        if: env.TS_CHECKS == 'true' || env.E2E_CHECKS == 'true'
+        run: bun install --frozen-lockfile
+
+      # Background tasks that need the install start right after it.
+      - name: "e2e: start in the background"
+        if: steps.install.outcome == 'success' && env.E2E_CHECKS == 'true' && steps.skip.outputs.e2e != 'true'
+        run: |
+          bun "$CI_SCRIPTS/ci-task.ts" start e2e <<'EOF'
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          # Lowest CPU priority: the trunk is on the critical path, e2e has slack.
+          renice -n 19 -p $$ >/dev/null || true
+          bunx playwright install --with-deps chromium
+          bun run test:e2e
+          EOF
+
+      - name: "coverage: start in the background"
+        if: steps.install.outcome == 'success' && env.TS_CHECKS == 'true' && steps.skip.outputs.coverage != 'true'
+        env:
+          WAIT_FOR_MARKER: ${{ env.TS_CHECKS }} # typecheck will run and write the marker
+        run: |
+          bun "$CI_SCRIPTS/ci-task.ts" start coverage <<'EOF'
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          renice -n 10 -p $$ >/dev/null || true
+          # Memory guard: on a machine under 24 GB, do not stack this peak on
+          # top of the typecheck's; on a big machine this returns at once.
+          bash "$CI_SCRIPTS/wait-for-marker.sh" coverage "$RUNNER_TEMP/typecheck.done"
+          bun run test:coverage
+          EOF
+
+      # `!cancelled()` instead of the implicit success(): one failing check must
+      # not hide the others. A rerun costs a start; show everything in one run.
+      - name: Lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && env.TS_CHECKS == 'true' }}
+        run: |
+          bash "$CI_SCRIPTS/step-window.sh" lint start
+          bun run lint
+          bash "$CI_SCRIPTS/step-window.sh" lint end
+
+      - name: Typecheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && env.TS_CHECKS == 'true' }}
+        run: |
+          # The marker is written pass or fail, so the coverage guard never waits forever.
+          trap 'touch "$RUNNER_TEMP/typecheck.done"' EXIT
+          bash "$CI_SCRIPTS/step-window.sh" typecheck start
+          bun run typecheck
+          bash "$CI_SCRIPTS/step-window.sh" typecheck end
+
+      - name: Build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && env.TS_CHECKS == 'true' }}
+        run: |
+          bash "$CI_SCRIPTS/step-window.sh" build start
+          bun run build
+          bash "$CI_SCRIPTS/step-window.sh" build end
+
+      - name: Unit tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && env.TS_CHECKS == 'true' }}
+        run: |
+          bash "$CI_SCRIPTS/step-window.sh" unit start
+          bun test
+          bash "$CI_SCRIPTS/step-window.sh" unit end
+
+      # --- Collect results ---------------------------------------------------------
+      # Each wait: same condition as its start (minus install), `!cancelled()` so
+      # it runs even if the trunk failed. Seconds count from the task's start.
+      # Exit 0 only if the task passed; prints the trimmed failure first.
+
+      - name: "coverage: result"
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && env.TS_CHECKS == 'true' && steps.skip.outputs.coverage != 'true' }}
+        run: bun "$CI_SCRIPTS/ci-task.ts" wait coverage 1500
+
+      - name: "e2e: result"
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && env.E2E_CHECKS == 'true' && steps.skip.outputs.e2e != 'true' }}
+        run: bun "$CI_SCRIPTS/ci-task.ts" wait e2e 1500
+
+      - name: "go-tests: result"
+        if: ${{ !cancelled() && env.GO_CHECKS == 'true' && steps.skip.outputs.go-tests != 'true' }}
+        run: bun "$CI_SCRIPTS/ci-task.ts" wait go-tests 1200
+
+      - name: "images: result"
+        if: ${{ !cancelled() && env.IMAGE_BUILD == 'true' && steps.skip.outputs.images != 'true' }}
+        run: bun "$CI_SCRIPTS/ci-task.ts" wait images 1800
+
+      - name: "postgres: stop"
+        if: always() && env.GO_CHECKS == 'true'
+        run: docker rm -fv ci-pg || true
+
+      # --- Measure, upload, publish (never turn the job red) ------------------------
+
+      - name: Per-task metrics
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: bun "$CI_SCRIPTS/task-metrics.ts"
+
+      - name: Upload machine samples
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: machine-samples-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/machine-samples.txt
+            ${{ runner.temp }}/background-steps/*.start
+            ${{ runner.temp }}/background-steps/*.end
+            ${{ runner.temp }}/background-steps/*.waited
+            ${{ runner.temp }}/step-windows/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # Task logs were masked before they were written (ci-task.ts mask) and again by `wait`.
+      - name: Upload task logs
+        id: task-logs
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-task-logs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/background-steps/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # One check `quality / <task>` per task that was waited for, on the PR
+      # head commit, with the trimmed failure and annotations. Fork PRs have a
+      # read-only token: this only warns.
+      - name: Publish one check per task
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'push') }}
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          ARTIFACT_NAME: quality-task-logs-${{ github.run_attempt }}
+          ARTIFACT_URL: ${{ steps.task-logs.outputs.artifact-url }}
+        run: bun "$CI_SCRIPTS/ci-task.ts" publish
+
+  # The second (and last) start on main. Small runner: it only talks to APIs.
+  deploy:
+    needs: quality
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON_DEPLOY || '["boat-small"]') }}
+    # Never cancel a deploy halfway.
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "deploy ${{ github.sha }}"
