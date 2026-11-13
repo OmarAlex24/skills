@@ -29,6 +29,13 @@ to "minimise starts without losing speed, clarity or safety".
 
 Everything below is generic GitHub Actions; Boat is the motivating case.
 
+This skill assumes the jobs already run on the per-start provider. To move
+them to Boat first (`runs-on: boat`, the CLI path from GitLab, CircleCI or
+Buildkite, snapshots, Docker/KVM, refused or paused jobs), use the companion
+skill **boat-ci** (https://omaralex.dev/skills/boat-ci/,
+`npx skills add OmarAlex24/portfolio --skill boat-ci`), then come back here
+when starts become the limit.
+
 ## Bundled resources
 
 | Path | Use it for |
