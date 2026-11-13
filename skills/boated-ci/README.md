@@ -14,6 +14,11 @@ From a real migration of a production TypeScript/Go monorepo: ~3.9 starts per
 run and a 964-starts day (over an 840/day cap) became **1 start per PR run**,
 ~32 % of the cap on the heaviest day, with the heavy job at ~380 s.
 
+Not on Boat yet? Its companion skill
+[boat-ci](https://omaralex.dev/skills/boat-ci/) moves the jobs there first
+(`runs-on: boat` or the CLI from any CI); this one takes over when starts
+become the limit.
+
 ## What the skill gives the agent
 
 - **A decision tree**: does your CI need this at all (audit first), should you
