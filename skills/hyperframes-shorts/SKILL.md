@@ -10,6 +10,8 @@ metadata:
   install: npx skills add OmarAlex24/skills --skill hyperframes-shorts
   agents: claude-code, codex, cursor, opencode, antigravity
   tags: video, hyperframes, tiktok, reels, shorts, gsap, agents
+  date: "2026-11-20"
+  video: "006b-como-hacer-videos-hyperframes"
   description_es: "Crea videos cortos animados (TikTok, Reels, Shorts) con código en HyperFrames. Primero entrevista al usuario en su mismo idioma para despejar dudas sobre tema, formato, estilo, voz y fuentes; luego aplica zonas seguras, ritmo y verificación visual con check y snapshot antes de renderizar."
   summary_es: "Flujo interactivo para producir videos cortos con HyperFrames y tu agente sin renders rotos ni texto tapado."
 ---
